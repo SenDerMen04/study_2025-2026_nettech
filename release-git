@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==========================================
+# release-git
+# Использование:
+#   ./release-git <LAB_NUM> [VERSION] [--draft] [--notes "Текст"] [--generate-notes] [--latest]
+#
+# Примеры:
+#   ./release-git 1             # lab1-v1.0.0
+#   ./release-git 2 2.1.0       # lab2-v2.1.0
+#   ./release-git 3 --draft --notes "Черновик"
+# ==========================================
+
+# ---- Аргументы ----
+if [[ ${1:-} =~ ^[0-9]+$ ]]; then
+  LAB_NUM="$1"; shift
+else
+  echo "❌ Укажите номер лабораторной: ./release-git 2"
+  exit 1
+fi
+
+VERSION_DEFAULT="${LAB_NUM}.0.0"
+if [[ ${1:-} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  VERSION="$1"; shift
+else
+  VERSION="$VERSION_DEFAULT"
+fi
+TAG="lab${LAB_NUM}-v${VERSION}"
+
+# Флаги
+DRAFT_FLAG=""
+NOTES="Lab ${LAB_NUM} artifacts"
+GENERATE_NOTES=""
+LATEST_FLAG=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --draft) DRAFT_FLAG="--draft"; shift;;
+    --notes) NOTES="${2:-$NOTES}"; shift 2;;
+    --generate-notes) GENERATE_NOTES="--generate-notes"; shift;;
+    --latest) LATEST_FLAG="--latest"; shift;;
+    *) echo "❌ Неизвестный параметр: $1"; exit 1;;
+  esac
+done
+
+# ---- Проверки окружения ----
+for bin in git gh zip; do
+  command -v "$bin" >/dev/null || { echo "❌ Не найдено: $bin"; exit 1; }
+done
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+cd "$REPO_ROOT"
+
+# owner/repo из origin (ssh или https)
+OWNER_REPO="$(git remote get-url origin | sed -E 's#.*github.com[:/ ]([^/]+/[^/.]+)(\.git)?#\1#')"
+if [[ -z "$OWNER_REPO" ]]; then
+  echo "❌ Не удалось определить owner/repo из origin"; exit 1
+fi
+
+echo "📦 Репозиторий: $OWNER_REPO"
+echo "🏷️  Тег: $TAG"
+
+# ---- Пути ----
+PRES_DIR="labs/lab${LAB_NUM}/presentation"
+REP_DIR="labs/lab${LAB_NUM}/report"
+
+PRES_QMD="${PRES_DIR}/mathsec--lab${LAB_NUM}--mathsec--lab${LAB_NUM}--presentation.qmd"
+PRES_HTML="${PRES_DIR}/_presentation/mathsec--lab${LAB_NUM}--mathsec--lab${LAB_NUM}--presentation.html"
+PRES_PDF="${PRES_DIR}/_presentation/mathsec--lab${LAB_NUM}--mathsec--lab${LAB_NUM}--presentation.pdf"
+
+REP_QMD="${REP_DIR}/mathsec--lab${LAB_NUM}--mathsec--lab${LAB_NUM}--report.qmd"
+REP_PDF="${REP_DIR}/_report/mathsec--lab${LAB_NUM}--mathsec--lab${LAB_NUM}--report.pdf"
+REP_DOCX="${REP_DIR}/_report/mathsec--lab${LAB_NUM}--mathsec--lab${LAB_NUM}--report.docx"
+
+ASSETS=()
+
+# ---- Упаковка image/ с уникальными именами (в тех же каталогах) ----
+if [[ -d "${PRES_DIR}/image" ]]; then
+  PRES_ZIP="${PRES_DIR}/presentation-image-${TAG}.zip"
+  rm -f "$PRES_ZIP"
+  ( cd "${PRES_DIR}" && zip -r "$(basename "$PRES_ZIP")" image >/dev/null )
+  ASSETS+=("$PRES_ZIP")
+fi
+if [[ -d "${REP_DIR}/image" ]]; then
+  REP_ZIP="${REP_DIR}/report-image-${TAG}.zip"
+  rm -f "$REP_ZIP"
+  ( cd "${REP_DIR}" && zip -r "$(basename "$REP_ZIP")" image >/dev/null )
+  ASSETS+=("$REP_ZIP")
+fi
+
+# ---- Добавляем артефакты, если существуют ----
+for f in "$PRES_QMD" "$PRES_HTML" "$PRES_PDF" "$REP_QMD" "$REP_PDF" "$REP_DOCX"; do
+  [[ -f "$f" ]] && ASSETS+=("$f")
+done
+
+if [[ ${#ASSETS[@]} -eq 0 ]]; then
+  echo "❌ Нет артефактов для Lab${LAB_NUM} — проверь пути"; exit 1
+fi
+
+# ---- Контрольные суммы ----
+SUMFILE="SHA256SUMS-lab${LAB_NUM}-${TAG}.txt"
+if command -v shasum >/dev/null 2>&1; then
+  shasum -a 256 "${ASSETS[@]}" > "$SUMFILE"
+  ASSETS+=("$SUMFILE")
+elif command -v sha256sum >/dev/null 2>&1; then
+  sha256sum "${ASSETS[@]}" > "$SUMFILE"
+  ASSETS+=("$SUMFILE")
+fi
+
+# ---- Проверка: уникальные имена ассетов (basename) ----
+declare -A NAMES=()
+for p in "${ASSETS[@]}"; do
+  base="$(basename "$p")"
+  if [[ -n "${NAMES[$base]:-}" ]]; then
+    echo "❌ Конфликт имён ассетов: '$base' встречается более одного раза."
+    echo "   Пути:"
+    printf '   - %s\n' "${NAMES[$base]}" "$p"
+    echo "   Переименуйте файлы, чтобы имена в релизе были уникальны."
+    exit 1
+  fi
+  NAMES[$base]="$p"
+done
+
+# ---- Превью ассетов ----
+echo "📝 К загрузке пойдут ассеты:"
+for p in "${ASSETS[@]}"; do
+  printf "   • %s\n" "$p"
+done
+
+# ---- Тег ----
+if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+  echo "ℹ️ Тег ${TAG} уже существует локально"
+else
+  git tag -a "$TAG" -m "Release ${TAG}"
+fi
+git push origin "$TAG" >/dev/null || true
+
+# ---- Релиз: create без ассетов ----
+if gh release view "$TAG" -R "$OWNER_REPO" >/dev/null 2>&1; then
+  echo "ℹ️ Релиз ${TAG} уже существует"
+else
+  echo "🚀 Создаю релиз ${TAG}..."
+  gh release create "$TAG" -R "$OWNER_REPO" \
+    --title "Lab${LAB_NUM}" \
+    --notes "$NOTES" \
+    ${DRAFT_FLAG} ${GENERATE_NOTES} ${LATEST_FLAG}
+fi
+
+# ---- Ждём готовность uploadUrl ----
+echo "⏳ Жду готовности upload endpoint..."
+for i in {1..15}; do
+  if gh release view "$TAG" -R "$OWNER_REPO" --json uploadUrl >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+
+# ---- Upload с ретраями ----
+echo "⬆️ Загружаю ассеты..."
+ATTEMPTS=0
+until gh release upload "$TAG" "${ASSETS[@]}" -R "$OWNER_REPO" --clobber; do
+  ((ATTEMPTS++))
+  if [[ $ATTEMPTS -ge 3 ]]; then
+    echo "❌ Не удалось загрузить ассеты после $ATTEMPTS попыток"
+    exit 1
+  fi
+  echo "⚠️ Ошибка upload, повтор через 3 секунды..."
+  sleep 3
+done
+
+echo "✅ Готово: релиз ${TAG} создан/обновлён."
